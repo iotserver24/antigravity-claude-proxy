@@ -281,3 +281,9 @@ This project is based on insights and code from:
 ## License
 
 MIT
+
+---
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=badri-s2001/antigravity_claude_server&type=Date)](https://star-history.com/#badri-s2001/antigravity_claude_server&Date)
