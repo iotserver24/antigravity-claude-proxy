@@ -144,6 +144,16 @@ export const OAUTH_CONFIG = {
 };
 export const OAUTH_REDIRECT_URI = `http://localhost:${OAUTH_CONFIG.callbackPort}/oauth-callback`;
 
+// Model fallback mapping - maps primary model to fallback when quota exhausted
+export const MODEL_FALLBACK_MAP = {
+    'gemini-3-pro-high': 'claude-opus-4-5-thinking',
+    'gemini-3-pro-low': 'claude-sonnet-4-5',
+    'gemini-3-flash': 'claude-sonnet-4-5-thinking',
+    'claude-opus-4-5-thinking': 'gemini-3-pro-high',
+    'claude-sonnet-4-5-thinking': 'gemini-3-flash',
+    'claude-sonnet-4-5': 'gemini-3-flash'
+};
+
 export default {
     ANTIGRAVITY_ENDPOINT_FALLBACKS,
     ANTIGRAVITY_HEADERS,
@@ -165,5 +175,6 @@ export default {
     getModelFamily,
     isThinkingModel,
     OAUTH_CONFIG,
-    OAUTH_REDIRECT_URI
+    OAUTH_REDIRECT_URI,
+    MODEL_FALLBACK_MAP
 };

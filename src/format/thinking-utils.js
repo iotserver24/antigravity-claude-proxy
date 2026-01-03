@@ -4,6 +4,7 @@
  */
 
 import { MIN_SIGNATURE_LENGTH } from '../constants.js';
+import { getCachedSignatureFamily } from './signature-cache.js';
 import { logger } from '../utils/logger.js';
 
 /**
@@ -24,6 +25,21 @@ export function isThinkingPart(part) {
 export function hasValidSignature(part) {
     const signature = part.thought === true ? part.thoughtSignature : part.signature;
     return typeof signature === 'string' && signature.length >= MIN_SIGNATURE_LENGTH;
+}
+
+/**
+ * Check if conversation history contains Gemini-style messages.
+ * Gemini puts thoughtSignature on tool_use blocks, Claude puts signature on thinking blocks.
+ * @param {Array<Object>} messages - Array of messages
+ * @returns {boolean} True if any tool_use has thoughtSignature (Gemini pattern)
+ */
+export function hasGeminiHistory(messages) {
+    return messages.some(msg =>
+        Array.isArray(msg.content) &&
+        msg.content.some(block =>
+            block.type === 'tool_use' && block.thoughtSignature !== undefined
+        )
+    );
 }
 
 /**
@@ -386,40 +402,83 @@ export function analyzeConversationState(messages) {
 
 /**
  * Check if conversation needs thinking recovery.
- * Returns true when:
- * 1. We're in a tool loop but have no valid thinking blocks, OR
- * 2. We have an interrupted tool with no valid thinking blocks
+ *
+ * Recovery is only needed when:
+ * 1. We're in a tool loop or have an interrupted tool, AND
+ * 2. No valid thinking blocks exist in the current turn
+ *
+ * Cross-model signature compatibility is handled by stripInvalidThinkingBlocks
+ * during recovery (not here).
  *
  * @param {Array<Object>} messages - Array of messages
  * @returns {boolean} True if thinking recovery is needed
  */
 export function needsThinkingRecovery(messages) {
     const state = analyzeConversationState(messages);
-    // Need recovery if (tool loop OR interrupted tool) AND no thinking
-    return (state.inToolLoop || state.interruptedTool) && !state.turnHasThinking;
+
+    // Recovery is only needed in tool loops or interrupted tools
+    if (!state.inToolLoop && !state.interruptedTool) return false;
+
+    // Need recovery if no valid thinking blocks exist
+    return !state.turnHasThinking;
 }
 
 /**
- * Strip all thinking blocks from messages.
+ * Strip invalid or incompatible thinking blocks from messages.
  * Used before injecting synthetic messages for recovery.
+ * Keeps valid thinking blocks to preserve context from previous turns.
  *
  * @param {Array<Object>} messages - Array of messages
- * @returns {Array<Object>} Messages with all thinking blocks removed
+ * @param {string} targetFamily - Target model family ('claude' or 'gemini')
+ * @returns {Array<Object>} Messages with invalid thinking blocks removed
  */
-function stripAllThinkingBlocks(messages) {
-    return messages.map(msg => {
+function stripInvalidThinkingBlocks(messages, targetFamily = null) {
+    let strippedCount = 0;
+
+    const result = messages.map(msg => {
         const content = msg.content || msg.parts;
         if (!Array.isArray(content)) return msg;
 
-        const filtered = content.filter(block => !isThinkingPart(block));
+        const filtered = content.filter(block => {
+            // Keep non-thinking blocks
+            if (!isThinkingPart(block)) return true;
 
+            // Check generic validity (has signature of sufficient length)
+            if (!hasValidSignature(block)) {
+                strippedCount++;
+                return false;
+            }
+
+            // Check family compatibility only for Gemini targets
+            // Claude can validate its own signatures, so we don't drop for Claude
+            if (targetFamily === 'gemini') {
+                const signature = block.thought === true ? block.thoughtSignature : block.signature;
+                const signatureFamily = getCachedSignatureFamily(signature);
+
+                // For Gemini: drop unknown or mismatched signatures
+                if (!signatureFamily || signatureFamily !== targetFamily) {
+                    strippedCount++;
+                    return false;
+                }
+            }
+
+            return true;
+        });
+
+        // Use '.' instead of '' because claude models reject empty text parts
         if (msg.content) {
-            return { ...msg, content: filtered.length > 0 ? filtered : [{ type: 'text', text: '' }] };
+            return { ...msg, content: filtered.length > 0 ? filtered : [{ type: 'text', text: '.' }] };
         } else if (msg.parts) {
-            return { ...msg, parts: filtered.length > 0 ? filtered : [{ text: '' }] };
+            return { ...msg, parts: filtered.length > 0 ? filtered : [{ text: '.' }] };
         }
         return msg;
     });
+
+    if (strippedCount > 0) {
+        logger.debug(`[ThinkingUtils] Stripped ${strippedCount} invalid/incompatible thinking block(s)`);
+    }
+
+    return result;
 }
 
 /**
@@ -432,16 +491,17 @@ function stripAllThinkingBlocks(messages) {
  * loop and allow the model to continue.
  *
  * @param {Array<Object>} messages - Array of messages
+ * @param {string} targetFamily - Target model family ('claude' or 'gemini')
  * @returns {Array<Object>} Modified messages with synthetic messages injected
  */
-export function closeToolLoopForThinking(messages) {
+export function closeToolLoopForThinking(messages, targetFamily = null) {
     const state = analyzeConversationState(messages);
 
     // Handle neither tool loop nor interrupted tool
     if (!state.inToolLoop && !state.interruptedTool) return messages;
 
-    // Strip all thinking blocks
-    let modified = stripAllThinkingBlocks(messages);
+    // Strip only invalid/incompatible thinking blocks (keep valid ones)
+    let modified = stripInvalidThinkingBlocks(messages, targetFamily);
 
     if (state.interruptedTool) {
         // For interrupted tools: just strip thinking and add a synthetic assistant message
@@ -457,7 +517,7 @@ export function closeToolLoopForThinking(messages) {
         });
 
         logger.debug('[ThinkingUtils] Applied thinking recovery for interrupted tool');
-    } else {
+    } else if (state.inToolLoop) {
         // For tool loops: add synthetic messages to close the loop
         const syntheticText = state.toolResultCount === 1
             ? '[Tool execution completed.]'
